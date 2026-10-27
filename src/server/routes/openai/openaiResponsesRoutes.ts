@@ -13,6 +13,7 @@ import {
   getChatModelClient,
   getCopilotModelConfiguration,
   withCopilotConfiguration,
+  withCopilotConversationId,
 } from "../../../utils/chatModels";
 import { logger } from "../../../utils/logger";
 import { CommonResponseError } from "../../schemas/openai";
@@ -23,14 +24,23 @@ import {
   LanguageModelRequestTimeoutError,
   interruptibleLanguageModelStream,
 } from "../../utils/languageModelRequestLifecycle";
+import {
+  encryptedThinkingOptions,
+  hasEncryptedThinking,
+  isThinkingPart,
+} from "../../utils/languageModelThinking";
 import { extractOpenAIResponsesUsage } from "../../utils/openai";
 import {
   OpenAIResponsesStatus,
   OutputItem,
   PlaintextResponseFunctionToolCall,
+  ProviderReasoningError,
+  ReasoningItems,
   ResponseSSEWriter,
+  ResponsesModelPart,
+  ResponsesReasoningError,
   buildOpenAIResponsesEnvelope,
-  buildResponseOutput,
+  buildResponseOutputFromParts,
   closeMessageOutputItem,
   convertResponsesInputToVSCode,
   customToolCallInput,
@@ -42,10 +52,12 @@ import {
   getCurrentTimestamp,
   openMessageOutputItem,
   plaintextFunctionCallMetadata,
+  thinkingToResponseReasoning,
   withOpenAIResponsesHeartbeat,
   writeCustomToolCallOutputItem,
   writeFunctionToolCallOutputItem,
   writeMessageOutputTextDelta,
+  writeReasoningOutputItem,
 } from "../../utils/openaiResponses";
 import {
   OpenAIResponsesRequestValidationError,
@@ -86,7 +98,7 @@ Limitations:
 - Images: only base64 data URI supported (URL-based images fall back to JSON)
 - input_file: not supported (serialized as JSON text)
 - URL citations are synthesized from normalized web search results; other annotations are empty
-- Reasoning: not generated (VSCode LM doesn't expose reasoning tokens)`,
+- Reasoning: encrypted state is replayed when the host exposes compatible thinking constructors`,
   request: {
     body: {
       content: {
@@ -200,8 +212,7 @@ export function registerOpenaiResponsesRoutes(
         include,
         background: _background,
         prompt: _prompt,
-        // Copilot manages prompt caching internally instead of using prompt_cache_key
-        prompt_cache_key: _cacheKey,
+        prompt_cache_key: promptCacheKey,
         service_tier: _serviceTier,
         user: _user,
         safety_identifier: _safetyId,
@@ -215,7 +226,10 @@ export function registerOpenaiResponsesRoutes(
 
       requestedModelId = model ?? "";
 
-      const modelOptions = otherParams as Record<string, unknown>;
+      const modelOptions = withCopilotConversationId(
+        otherParams as Record<string, unknown>,
+        promptCacheKey,
+      );
       if (max_output_tokens !== null && max_output_tokens !== undefined) {
         modelOptions.maxTokens = max_output_tokens;
       }
@@ -330,6 +344,7 @@ export function registerOpenaiResponsesRoutes(
       lmChatMessages = vsCodeMessages;
 
       const lmRequestOptions: vscode.LanguageModelChatRequestOptions = {
+        ...encryptedThinkingOptions(),
         justification:
           "OpenAI Responses API endpoint using VS Code Language Model API",
         modelOptions,
@@ -381,6 +396,7 @@ export function registerOpenaiResponsesRoutes(
         let accumulatedText = "";
         const toolCalls: { callId: string; name: string; input: unknown }[] =
           [];
+        const parts: ResponsesModelPart[] = [];
         let responseUsage: ResponseUsage | undefined;
 
         for await (const chunk of interruptibleLanguageModelStream(
@@ -389,21 +405,26 @@ export function registerOpenaiResponsesRoutes(
         )) {
           if (chunk instanceof vscode.LanguageModelTextPart) {
             accumulatedText += chunk.value;
+            parts.push(chunk);
           } else if (chunk instanceof vscode.LanguageModelToolCallPart) {
+            parts.push(chunk);
             toolCalls.push({
               callId: chunk.callId,
               name: chunk.name,
               input: chunk.input,
             });
+          } else if (isThinkingPart(chunk)) {
+            if (hasEncryptedThinking(chunk)) {
+              parts.push(chunk);
+            }
           } else if (chunk instanceof vscode.LanguageModelDataPart) {
             responseUsage = extractOpenAIResponsesUsage(chunk) ?? responseUsage;
           }
         }
 
         // Build output
-        const output = buildResponseOutput(
-          accumulatedText,
-          toolCalls,
+        const output = buildResponseOutputFromParts(
+          parts,
           preparedTools.toolMap,
         );
 
@@ -518,6 +539,7 @@ export function registerOpenaiResponsesRoutes(
               );
               // Process stream
               const output: OutputItem[] = [];
+              const reasoning = new ReasoningItems("provider");
               let outputIndex = 0;
               let contentIndex = 0;
               let currentMessageId: string | null = null;
@@ -619,6 +641,35 @@ export function registerOpenaiResponsesRoutes(
                     sequenceNumberRef,
                   );
                   outputIndex++;
+                } else if (isThinkingPart(chunk)) {
+                  const item = thinkingToResponseReasoning(chunk);
+                  if (
+                    !item ||
+                    !reasoning.accept(item.id, item.encrypted_content)
+                  ) {
+                    continue;
+                  }
+                  if (currentMessageId) {
+                    output.push(
+                      await closeMessageOutputItem(
+                        writeSSE,
+                        currentMessageId,
+                        outputIndex++,
+                        contentIndex,
+                        accumulatedText,
+                        sequenceNumberRef,
+                      ),
+                    );
+                    currentMessageId = null;
+                    accumulatedText = "";
+                  }
+                  output.push(item);
+                  await writeReasoningOutputItem(
+                    writeSSE,
+                    item,
+                    outputIndex++,
+                    sequenceNumberRef,
+                  );
                 } else if (chunk instanceof vscode.LanguageModelDataPart) {
                   responseUsage =
                     extractOpenAIResponsesUsage(chunk) ?? responseUsage;
@@ -715,7 +766,9 @@ export function registerOpenaiResponsesRoutes(
                     code:
                       error instanceof LanguageModelRequestTimeoutError
                         ? "request_timeout"
-                        : "server_error",
+                        : error instanceof ProviderReasoningError
+                          ? error.code
+                          : "server_error",
                     message:
                       error instanceof Error ? error.message : String(error),
                   },
@@ -734,7 +787,25 @@ export function registerOpenaiResponsesRoutes(
     } catch (error) {
       requestLifecycle?.dispose();
 
-      if (error instanceof OpenAIResponsesRequestValidationError) {
+      if (error instanceof ProviderReasoningError) {
+        logger.error("Responses provider returned conflicting reasoning state");
+        return c.json(
+          {
+            error: {
+              type: "upstream_error",
+              message: error.message,
+              param: null,
+              code: error.code,
+            },
+          },
+          502,
+        );
+      }
+
+      if (
+        error instanceof OpenAIResponsesRequestValidationError ||
+        error instanceof ResponsesReasoningError
+      ) {
         return c.json(
           {
             error: {

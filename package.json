@@ -2,7 +2,7 @@
   "name": "agent-maestro",
   "displayName": "Agent Maestro",
   "description": "Turn VS Code into your compliant AI playground! With Agent Maestro, spin up Cline or Roo on demand and plug Claude Code or Codex straight in through an OpenAI/Anthropic-compatible API.",
-  "version": "2.14.0",
+  "version": "2.15.0",
   "icon": "assets/icons/icon.png",
   "publisher": "Joouis",
   "enabledApiProposals": [
@@ -10,7 +10,7 @@
   ],
   "repository": "https://github.com/Joouis/agent-maestro",
   "engines": {
-    "vscode": "^1.120.0",
+    "vscode": "^1.142.0",
     "node": ">=22"
   },
   "packageManager": "pnpm@11.9.0",
@@ -168,6 +168,11 @@
         "category": "Agent Maestro"
       },
       {
+        "command": "agent-maestro.configureCopilotPromptCache",
+        "title": "Configure Copilot Prompt Cache",
+        "category": "Agent Maestro"
+      },
+      {
         "command": "agent-maestro.setLlmApiKey",
         "title": "Set LLM API Key",
         "category": "Agent Maestro"
@@ -192,7 +197,7 @@
     "es-toolkit": "^1.39.3",
     "fastmcp": "^3.5.0",
     "hono": "^4.8.9",
-    "image-size": "^2.0.2",
+    "image-size": "^2.0.4",
     "openai": "^6.46.0",
     "smol-toml": "^1.6.0",
     "zod": "^4.0.10"
@@ -202,7 +207,7 @@
     "@trivago/prettier-plugin-sort-imports": "^5.2.2",
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
-    "@types/vscode": "^1.120.0",
+    "@types/vscode": "^1.140.0",
     "@typescript-eslint/eslint-plugin": "^8.31.1",
     "@typescript-eslint/parser": "^8.31.1",
     "@vscode/test-cli": "^0.0.10",

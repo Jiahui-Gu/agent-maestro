@@ -1,9 +1,18 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 
+import {
+  ThinkingPart,
+  detectThinkingRuntime,
+  getThinkingRuntime,
+} from "../../server/utils/languageModelThinking";
 import { extractOpenAIResponsesUsage } from "../../server/utils/openai";
 import {
+  CUSTOM_TOOL_INPUT_SCHEMA,
+  ProviderReasoningError,
+  ResponsesReasoningError,
   buildResponseOutput,
+  buildResponseOutputFromParts,
   convertInputContentToVSCodePart,
   convertResponsesInputToVSCode,
   convertResponsesItemToVSCode,
@@ -15,13 +24,759 @@ import {
   generateMessageId,
   generateResponseId,
   narrowToolsForChoice,
+  restoreReasoningPart,
+  thinkingToResponseReasoning,
 } from "../../server/utils/openaiResponses";
+import { toolHistoryToVSCode } from "../../server/utils/toolResultPairing";
 import { logger } from "../../utils/logger";
 
 const encode = (value: unknown): Uint8Array =>
   new TextEncoder().encode(JSON.stringify(value));
 
 suite("OpenAI Responses Conversion Utils Test Suite", () => {
+  suite("Encrypted reasoning", () => {
+    test("records current AM ordering of thinking, call, text, call", () => {
+      const runtime = getThinkingRuntime()!;
+      const thinking = new runtime.Thinking("", "provider-state", {
+        encrypted_content: "opaque-state",
+        vscode_thinking_origin_api: "responses",
+      });
+      const call = (id: string) => ({
+        kind: "call" as const,
+        id,
+        name: "lookup",
+        input: {},
+        value: {},
+        toolType: "function",
+      });
+      const result = (id: string) => ({
+        kind: "result" as const,
+        id,
+        parts: [new vscode.LanguageModelTextPart("ok")],
+        value: "ok",
+        toolType: "function",
+      });
+      // This captures current AM ordering; provider acceptance is a separate check.
+      const messages = toolHistoryToVSCode(
+        [
+          {
+            role: "assistant",
+            parts: [
+              { kind: "reasoning", part: thinking },
+              call("first"),
+              {
+                kind: "content",
+                parts: [new vscode.LanguageModelTextPart("between")],
+              },
+              call("second"),
+            ],
+          },
+          { role: "user", parts: [result("first"), result("second")] },
+        ],
+        "Responses",
+      );
+      assert.strictEqual(messages.length, 2);
+      assert.strictEqual(messages[0].content[0], thinking);
+      assert.deepStrictEqual(
+        messages[0].content.map((part) => {
+          if (part instanceof runtime.Thinking) {
+            return "thinking";
+          }
+          if (part instanceof vscode.LanguageModelToolCallPart) {
+            return part.callId;
+          }
+          return (part as vscode.LanguageModelTextPart).value;
+        }),
+        ["thinking", "first", "between", "second"],
+      );
+      assert.deepStrictEqual(
+        messages[1].content.map(
+          (part) => (part as vscode.LanguageModelToolResultPart).callId,
+        ),
+        ["first", "second"],
+      );
+    });
+    test("retains opaque state through a normalized tool continuation", () => {
+      const input = [
+        { role: "user" as const, content: "Read status" },
+        {
+          type: "reasoning" as const,
+          id: "rs_provider",
+          summary: [],
+          encrypted_content: "opaque-state",
+        },
+        {
+          type: "function_call" as const,
+          call_id: "lookup",
+          name: "lookup",
+          arguments: "{}",
+        },
+        {
+          type: "function_call_output" as const,
+          call_id: "lookup",
+          output: "ready",
+        },
+      ];
+      const snapshot = structuredClone(input);
+      const messages = convertResponsesInputToVSCode(input);
+      const parts = messages.flatMap(({ content }) => content);
+      const reasoning = parts.find(
+        (part) => part instanceof getThinkingRuntime()!.Thinking,
+      ) as unknown as ThinkingPart;
+      assert.ok(reasoning);
+      assert.strictEqual(reasoning.value, "");
+      assert.strictEqual(reasoning.id, "rs_provider");
+      assert.strictEqual(reasoning.metadata?.encrypted_content, "opaque-state");
+      const calls = parts.filter(
+        (part) => part instanceof vscode.LanguageModelToolCallPart,
+      );
+      const results = parts.filter(
+        (part) => part instanceof vscode.LanguageModelToolResultPart,
+      );
+      assert.strictEqual(calls.length, 1);
+      assert.strictEqual(results.length, 1);
+      assert.strictEqual(calls[0].callId, results[0].callId);
+      assert.deepStrictEqual(input, snapshot);
+    });
+
+    test("diagnoses summary-only reasoning and rejects malformed encrypted input", () => {
+      const debug: string[] = [],
+        warnings: string[] = [];
+      const oldDebug = logger.debug,
+        oldWarn = logger.warn;
+      logger.debug = (message) => {
+        debug.push(message);
+      };
+      logger.warn = (message) => {
+        warnings.push(message);
+      };
+      try {
+        assert.strictEqual(
+          convertResponsesItemToVSCode({
+            type: "reasoning",
+            id: "summary",
+            summary: [],
+          }),
+          null,
+        );
+        for (const item of [
+          { type: "reasoning", id: "rs_empty", encrypted_content: "" },
+          { type: "reasoning", id: 1, encrypted_content: "opaque" },
+        ]) {
+          assert.throws(
+            () => convertResponsesItemToVSCode(item as any),
+            ResponsesReasoningError,
+          );
+        }
+        assert.match(debug[0], /summary-only/);
+        assert.strictEqual(warnings.length, 2);
+        assert.ok(!JSON.stringify(warnings).includes("opaque"));
+      } finally {
+        logger.debug = oldDebug;
+        logger.warn = oldWarn;
+      }
+    });
+
+    test("replays Codex opaque state without an ID preserving the original provider ID", () => {
+      const part = new (getThinkingRuntime()!.Thinking)("", "provider-id", {
+        encrypted_content: "opaque",
+        vscode_thinking_origin_api: "responses",
+      });
+      const { id: _id, ...item } = thinkingToResponseReasoning(part)!;
+      const converted = convertResponsesInputToVSCode([item, item] as any);
+      assert.strictEqual(converted.length, 1);
+      const restored = converted[0].content[0] as unknown as ThinkingPart;
+      assert.strictEqual(restored.id, "provider-id");
+      assert.strictEqual(restored.metadata?.encrypted_content, "opaque");
+      const again = convertResponsesItemToVSCode(item as any)!
+        .content[0] as unknown as ThinkingPart;
+      assert.strictEqual(restored.id, again.id);
+      assert.throws(
+        () =>
+          convertResponsesItemToVSCode({
+            type: "reasoning",
+            summary: [],
+            encrypted_content: "am_reasoning_v1:broken",
+          } as any),
+        ResponsesReasoningError,
+      );
+    });
+
+    test("frames large reasoning state with constant additive overhead", () => {
+      for (const size of [10_000, 100_000]) {
+        const encrypted = "A".repeat(size);
+        const part = new (getThinkingRuntime()!.Thinking)("", "rs_provider_1", {
+          encrypted_content: encrypted,
+          vscode_thinking_origin_api: "responses",
+        });
+        const output = thinkingToResponseReasoning(part)!;
+        assert.strictEqual(
+          output.encrypted_content,
+          "am_reasoning_v1:13:rs_provider_1" + encrypted,
+        );
+        assert.strictEqual(
+          Buffer.byteLength(output.encrypted_content, "utf8"),
+          size + 32,
+        );
+        const restored = convertResponsesItemToVSCode(output)!
+          .content[0] as unknown as ThinkingPart;
+        assert.strictEqual(restored.id, part.id);
+        assert.strictEqual(restored.metadata?.encrypted_content, encrypted);
+      }
+    });
+
+    test("preserves UTF-8 IDs and delimiter-bearing ciphertext without re-encoding", () => {
+      const encrypted = 'cipher:___:am_reasoning_v1:quotes"\\\n\0状态🧠';
+      for (const id of [
+        "rs:provider:123",
+        "rs___provider",
+        "rs:状态:🧠",
+        'rs_\0"\\\n',
+        "\uFFFD",
+      ]) {
+        const part = new (getThinkingRuntime()!.Thinking)("", id, {
+          encrypted_content: encrypted,
+          vscode_thinking_origin_api: "responses",
+        });
+        const output = thinkingToResponseReasoning(part)!;
+        assert.strictEqual(
+          output.encrypted_content,
+          `am_reasoning_v1:${Buffer.byteLength(id, "utf8")}:${id}${encrypted}`,
+        );
+        const replay = { ...output, id: "rewritten-outer-id" };
+        const restored = convertResponsesItemToVSCode(replay)!
+          .content[0] as unknown as ThinkingPart;
+        assert.strictEqual(restored.id, id);
+        assert.strictEqual(restored.metadata?.encrypted_content, encrypted);
+        const history = convertResponsesInputToVSCode([
+          output,
+          replay,
+          { ...output, encrypted_content: encrypted },
+        ]);
+        assert.strictEqual(history.length, 1);
+        assert.strictEqual(history[0].content.length, 1);
+      }
+    });
+
+    test("rejects malformed byte-length framing without exposing private state", () => {
+      const warnings: string[] = [];
+      const originalWarn = logger.warn;
+      logger.warn = (message) => {
+        warnings.push(message);
+      };
+      const malformed = [
+        "",
+        "broken",
+        ":private-ciphertext",
+        "0:private-ciphertext",
+        "-1:private-ciphertext",
+        "+1:private-ciphertext",
+        "01:private-ciphertext",
+        "1.0:private-ciphertext",
+        "1e0:private-ciphertext",
+        "0x10:private-ciphertext",
+        " 1:private-ciphertext",
+        "1 :private-ciphertext",
+        "1\n:private-ciphertext",
+        "1\r:private-ciphertext",
+        "1\u2028:private-ciphertext",
+        "1\u2029:private-ciphertext",
+        "Infinity:private-ciphertext",
+        "NaN:private-ciphertext",
+        "9007199254740992:private-ciphertext",
+        "9007199254740991:private-ciphertext",
+        "15:rs",
+        "3:abc",
+        "2:é",
+        "1:éprivate-ciphertext",
+        "1:🧠private-ciphertext",
+        "3:🧠private-ciphertext",
+        Buffer.from(
+          JSON.stringify({ id: "rs", encrypted: "private-ciphertext" }),
+        ).toString("base64url"),
+      ];
+      try {
+        for (const state of malformed) {
+          assert.throws(
+            () =>
+              convertResponsesInputToVSCode([
+                {
+                  type: "reasoning",
+                  id: "outer-id",
+                  summary: [],
+                  encrypted_content: "am_reasoning_v1:" + state,
+                },
+              ]),
+            (error: unknown) => {
+              assert.ok(error instanceof ResponsesReasoningError);
+              assert.strictEqual(error.code, "invalid_reasoning");
+              assert.strictEqual(error.param, "input");
+              assert.ok(!error.message.includes("private-ciphertext"));
+              return true;
+            },
+          );
+        }
+        assert.strictEqual(warnings.length, malformed.length);
+        assert.ok(
+          warnings.every((message) => !message.includes("private-ciphertext")),
+        );
+      } finally {
+        logger.warn = originalWarn;
+      }
+    });
+
+    test("rejects provider IDs that cannot round-trip through UTF-8", () => {
+      for (const id of ["\uD800", "\uDC00", "rs_\uD800"]) {
+        const part = new (getThinkingRuntime()!.Thinking)("", id, {
+          encrypted_content: "private-ciphertext",
+          vscode_thinking_origin_api: "responses",
+        });
+        assert.throws(
+          () => thinkingToResponseReasoning(part),
+          ProviderReasoningError,
+        );
+      }
+    });
+
+    test("reasoning between parallel calls does not break call/result pairing", () => {
+      const result = convertResponsesInputToVSCode([
+        { type: "function_call", call_id: "a", name: "first", arguments: "{}" },
+        {
+          type: "reasoning",
+          id: "rs_parallel",
+          summary: [],
+          encrypted_content: "opaque",
+        },
+        {
+          type: "function_call",
+          call_id: "b",
+          name: "second",
+          arguments: "{}",
+        },
+        { type: "function_call_output", call_id: "a", output: "first" },
+        { type: "function_call_output", call_id: "b", output: "second" },
+      ]);
+      assert.strictEqual(result.length, 2);
+      assert.strictEqual(
+        result[0].content.filter(
+          (part) => part instanceof vscode.LanguageModelToolCallPart,
+        ).length,
+        2,
+      );
+      assert.strictEqual(
+        result[1].content.filter(
+          (part) => part instanceof vscode.LanguageModelToolResultPart,
+        ).length,
+        2,
+      );
+      assert.ok(
+        result[0].content.some(
+          (part) => part instanceof getThinkingRuntime()!.Thinking,
+        ),
+      );
+      assert.deepStrictEqual(
+        result[0].content.map((part) =>
+          part instanceof vscode.LanguageModelToolCallPart
+            ? part.callId
+            : "reasoning",
+        ),
+        ["a", "reasoning", "b"],
+      );
+    });
+
+    test("preserves assistant boundaries and alternating reasoning/call order", () => {
+      const reasoningItem = (id: string) => ({
+        type: "reasoning" as const,
+        id,
+        summary: [],
+        encrypted_content: `state-${id}`,
+      });
+      const functionCall = (id: string) => ({
+        type: "function_call" as const,
+        call_id: id,
+        name: id,
+        arguments: "{}",
+      });
+      const functionCallOutput = (id: string) => ({
+        type: "function_call_output" as const,
+        call_id: id,
+        output: "ok",
+      });
+      const result = convertResponsesInputToVSCode([
+        { role: "assistant", content: "A" },
+        reasoningItem("R1"),
+        functionCall("C1"),
+        reasoningItem("R2"),
+        functionCall("C2"),
+        functionCallOutput("C1"),
+        functionCallOutput("C2"),
+      ]);
+      assert.strictEqual(result.length, 3);
+      assert.strictEqual(
+        (result[0].content[0] as vscode.LanguageModelTextPart).value,
+        "A",
+      );
+      assert.deepStrictEqual(
+        result[1].content.map((part) =>
+          part instanceof vscode.LanguageModelToolCallPart
+            ? part.callId
+            : (part as unknown as ThinkingPart).id,
+        ),
+        ["R1", "C1", "R2", "C2"],
+      );
+    });
+
+    test("round-trips source-ordered output with assistant text between pending tool calls", () => {
+      for (const includeThinking of [false, true]) {
+        const thinking = new (getThinkingRuntime()!.Thinking)(
+          "",
+          "rs_roundtrip",
+          {
+            encrypted_content: "opaque-roundtrip",
+            vscode_thinking_origin_api: "responses",
+          },
+        );
+        const output = buildResponseOutputFromParts(
+          [
+            new vscode.LanguageModelTextPart("Before"),
+            new vscode.LanguageModelToolCallPart("first", "lookup", {}),
+            ...(includeThinking ? [thinking] : []),
+            new vscode.LanguageModelTextPart("Between"),
+            new vscode.LanguageModelToolCallPart("second", "lookup", {}),
+            new vscode.LanguageModelTextPart("After"),
+          ],
+          new Map(),
+        );
+        const input = [
+          ...output,
+          {
+            type: "function_call_output" as const,
+            call_id: "second",
+            output: "B",
+          },
+          {
+            type: "function_call_output" as const,
+            call_id: "first",
+            output: "A",
+          },
+        ];
+        const snapshot = structuredClone(input);
+        const messages = convertResponsesInputToVSCode(input);
+        assert.deepStrictEqual(
+          messages.flatMap(({ content }) =>
+            content.map((part) => {
+              if (part instanceof vscode.LanguageModelToolCallPart) {
+                return `call:${part.callId}`;
+              }
+              if (part instanceof vscode.LanguageModelToolResultPart) {
+                return `result:${part.callId}`;
+              }
+              if (part instanceof vscode.LanguageModelTextPart) {
+                return part.value;
+              }
+              return (part as unknown as ThinkingPart).id;
+            }),
+          ),
+          [
+            "Before",
+            "call:first",
+            ...(includeThinking ? ["rs_roundtrip"] : []),
+            "Between",
+            "call:second",
+            "After",
+            "result:second",
+            "result:first",
+          ],
+        );
+        assert.deepStrictEqual(input, snapshot);
+      }
+    });
+
+    test("does not pair reasoning tool history across empty independent messages", () => {
+      for (const role of ["user", "developer", "system"] as const) {
+        const messages = convertResponsesInputToVSCode([
+          {
+            type: "reasoning",
+            id: "rs_boundary",
+            summary: [],
+            encrypted_content: "opaque",
+          },
+          {
+            type: "function_call",
+            call_id: "call_boundary",
+            name: "lookup",
+            arguments: "{}",
+          },
+          { role, content: [] },
+          {
+            type: "function_call_output",
+            call_id: "call_boundary",
+            output: "ready",
+          },
+        ]);
+        const parts = messages.flatMap(({ content }) => content);
+        assert.ok(
+          !parts.some(
+            (part) => part instanceof vscode.LanguageModelToolCallPart,
+          ),
+        );
+        assert.ok(
+          !parts.some(
+            (part) => part instanceof vscode.LanguageModelToolResultPart,
+          ),
+        );
+      }
+    });
+
+    test("keeps new-turn reasoning after completed tool results and respects user boundaries", () => {
+      const call = (id: string) => ({
+        type: "function_call" as const,
+        call_id: id,
+        name: id,
+        arguments: "{}",
+      });
+      const result = (id: string) => ({
+        type: "function_call_output" as const,
+        call_id: id,
+        output: "ready",
+      });
+      const reasoning = (id: string) => ({
+        type: "reasoning" as const,
+        id,
+        summary: [],
+        encrypted_content: `state-${id}`,
+      });
+      const messages = convertResponsesInputToVSCode([
+        call("first"),
+        result("first"),
+        reasoning("second-state"),
+        call("second"),
+        result("second"),
+        { role: "user", content: "Next task" },
+        reasoning("third-state"),
+        call("third"),
+        result("third"),
+      ]);
+      const labels = messages.map(({ content }) =>
+        content.map((part) => {
+          if (part instanceof vscode.LanguageModelToolCallPart) {
+            return `call:${part.callId}`;
+          }
+          if (part instanceof vscode.LanguageModelToolResultPart) {
+            return `result:${part.callId}`;
+          }
+          if (part instanceof vscode.LanguageModelTextPart) {
+            return part.value;
+          }
+          return (part as unknown as ThinkingPart).id;
+        }),
+      );
+      assert.deepStrictEqual(labels, [
+        ["call:first"],
+        ["result:first"],
+        ["second-state", "call:second"],
+        ["result:second"],
+        ["Next task"],
+        ["third-state", "call:third"],
+        ["result:third"],
+      ]);
+    });
+
+    test("detects absent and throwing runtimes and rejects unavailable replay", () => {
+      assert.strictEqual(detectThinkingRuntime({}), undefined);
+      assert.strictEqual(
+        detectThinkingRuntime({
+          get LanguageModelThinkingPart() {
+            throw new Error("private failure");
+          },
+        }),
+        undefined,
+      );
+      assert.throws(
+        () =>
+          restoreReasoningPart(
+            {
+              type: "reasoning",
+              id: "rs",
+              summary: [],
+              encrypted_content: "opaque",
+            },
+            undefined,
+          ),
+        (error: unknown) => {
+          assert.ok(error instanceof ResponsesReasoningError);
+          assert.strictEqual(error.code, "reasoning_unavailable");
+          assert.match(error.message, /does not expose the thinking runtime/);
+          assert.match(error.message, /updating VS Code and GitHub Copilot/);
+          assert.match(
+            error.message,
+            /start a new session without this reasoning history/,
+          );
+          assert.match(error.message, /VS Code 1\.142\.0 \/ Copilot 0\.70\.0/);
+          assert.match(error.message, /not guaranteed/);
+          assert.ok(!error.message.includes("opaque"));
+          return true;
+        },
+      );
+    });
+
+    test("deduplicates reasoning IDs and rejects conflicting encrypted state", () => {
+      const runtime = getThinkingRuntime()!;
+      const part = new runtime.Thinking("", "rs_same", {
+        encrypted_content: "state",
+        vscode_thinking_origin_api: "responses",
+      });
+      assert.strictEqual(
+        buildResponseOutputFromParts([part, part], new Map()).length,
+        1,
+      );
+      const conflict = new runtime.Thinking("", "rs_same", {
+        encrypted_content: "different",
+        vscode_thinking_origin_api: "responses",
+      });
+      assert.throws(
+        () => buildResponseOutputFromParts([part, conflict], new Map()),
+        ProviderReasoningError,
+      );
+      const item = {
+        type: "reasoning" as const,
+        id: "rs_same",
+        encrypted_content: "state",
+        summary: [],
+      };
+      assert.strictEqual(convertResponsesInputToVSCode([item, item]).length, 1);
+      assert.throws(
+        () =>
+          convertResponsesInputToVSCode([
+            item,
+            { ...item, encrypted_content: "different" },
+          ]),
+        ResponsesReasoningError,
+      );
+    });
+
+    test("replays the provider ID from opaque state when a client rewrites outer IDs", () => {
+      const runtime = getThinkingRuntime()!;
+      const original = new runtime.Thinking("", "original-provider-id", {
+        encrypted_content: "original-provider-ciphertext",
+        vscode_thinking_origin_api: "responses",
+      });
+      const output = thinkingToResponseReasoning(original)!;
+      const rewritten = { ...output, id: "client-item-id" };
+      const restored = convertResponsesItemToVSCode(rewritten)!
+        .content[0] as unknown as ThinkingPart;
+      assert.strictEqual(restored.id, original.id);
+      assert.strictEqual(
+        restored.metadata?.encrypted_content,
+        original.metadata?.encrypted_content,
+      );
+      const history = convertResponsesInputToVSCode([output, rewritten]);
+      assert.strictEqual(history.length, 1);
+      assert.strictEqual(history[0].content.length, 1);
+    });
+
+    test("rejects hosts that discard or rewrite encrypted reasoning state", () => {
+      const runtime = getThinkingRuntime()!;
+      const originalThinking = runtime.Thinking;
+      const originalWarn = logger.warn;
+      const warnings: string[] = [];
+      logger.warn = (message) => {
+        warnings.push(message);
+      };
+      try {
+        for (const failure of ["metadata", "id", "ciphertext", "origin"]) {
+          runtime.Thinking = class {
+            readonly id?: string;
+            readonly metadata: Readonly<Record<string, unknown>>;
+            constructor(
+              readonly value: string | string[],
+              id?: string,
+              metadata?: Readonly<Record<string, unknown>>,
+            ) {
+              this.id = failure === "id" ? "rewritten" : id;
+              this.metadata =
+                failure === "metadata"
+                  ? {}
+                  : {
+                      ...metadata,
+                      ...(failure === "ciphertext" && {
+                        encrypted_content: "rewritten",
+                      }),
+                      ...(failure === "origin" && {
+                        vscode_thinking_origin_api: "messages",
+                      }),
+                    };
+            }
+          };
+          assert.throws(
+            () =>
+              convertResponsesInputToVSCode([
+                {
+                  type: "reasoning",
+                  id: "provider-id",
+                  summary: [],
+                  encrypted_content: "private-ciphertext",
+                },
+              ]),
+            (error: unknown) => {
+              assert.ok(error instanceof ResponsesReasoningError);
+              assert.strictEqual(error.code, "reasoning_unavailable");
+              assert.ok(!error.message.includes("private-ciphertext"));
+              return true;
+            },
+          );
+        }
+        assert.strictEqual(warnings.length, 4);
+        assert.ok(
+          warnings.every((message) => !message.includes("private-ciphertext")),
+        );
+      } finally {
+        runtime.Thinking = originalThinking;
+        logger.warn = originalWarn;
+      }
+    });
+
+    test("only serializes Responses-origin ciphertext, never private thinking text", () => {
+      for (const metadata of [
+        undefined,
+        { encrypted_content: "opaque" },
+        { encrypted_content: "opaque", vscode_thinking_origin_api: "messages" },
+      ]) {
+        const part = new (getThinkingRuntime()!.Thinking)(
+          "private-text",
+          "rs_provider",
+          metadata,
+        );
+        assert.strictEqual(thinkingToResponseReasoning(part), undefined);
+      }
+      const part = new (getThinkingRuntime()!.Thinking)(
+        "private-text",
+        "rs_provider",
+        {
+          encrypted_content: "opaque",
+          vscode_thinking_origin_api: "responses",
+        },
+      );
+      const output = buildResponseOutputFromParts(
+        [
+          new vscode.LanguageModelTextPart("before"),
+          part,
+          new vscode.LanguageModelToolCallPart("call", "lookup", {}),
+          new vscode.LanguageModelTextPart("after"),
+        ],
+        new Map(),
+      );
+      assert.deepStrictEqual(
+        output.map(({ type }) => type),
+        ["message", "reasoning", "function_call", "message"],
+      );
+      assert.ok(!JSON.stringify(output).includes("private-text"));
+      const restored = convertResponsesItemToVSCode(output[1] as any)!
+        .content[0] as unknown as ThinkingPart;
+      assert.strictEqual(restored.id, "rs_provider");
+      assert.strictEqual(restored.metadata?.encrypted_content, "opaque");
+    });
+  });
   suite("ID Generation Functions", () => {
     test("generateResponseId should return string starting with resp_AM-", () => {
       const id = generateResponseId();
@@ -931,7 +1686,7 @@ suite("OpenAI Responses Conversion Utils Test Suite", () => {
       assert.strictEqual(result[0].description, "");
     });
 
-    test("should convert custom tool to a schema-less tool", () => {
+    test("should declare the raw input wrapper for custom tools", () => {
       const tools = [
         {
           type: "custom" as const,
@@ -944,7 +1699,7 @@ suite("OpenAI Responses Conversion Utils Test Suite", () => {
       assert.strictEqual(result.length, 1);
       assert.strictEqual(result[0].name, "exec");
       assert.strictEqual(result[0].description, "Run JavaScript");
-      assert.strictEqual(result[0].inputSchema, undefined);
+      assert.deepStrictEqual(result[0].inputSchema, CUSTOM_TOOL_INPUT_SCHEMA);
     });
 
     test("should encode namespace tools as <ns>__<name> with a toolMap", () => {
@@ -968,6 +1723,16 @@ suite("OpenAI Responses Conversion Utils Test Suite", () => {
         tools as any,
       );
       assert.strictEqual(result.length, 2);
+      assert.strictEqual(result[0].description, "Sub-agent tools\n\nSpawn");
+      assert.strictEqual(result[1].description, "Sub-agent tools\n\nRaw");
+      assert.deepStrictEqual(result[0].inputSchema, {
+        type: "object",
+        properties: {},
+      });
+      assert.deepStrictEqual(
+        (result[1].inputSchema as { required: string[] }).required,
+        ["input"],
+      );
       assert.deepStrictEqual(
         result.map((t) => t.name),
         ["collaboration__spawn_agent", "collaboration__raw_helper"],
@@ -983,6 +1748,84 @@ suite("OpenAI Responses Conversion Utils Test Suite", () => {
         name: "raw_helper",
         isCustom: true,
       });
+    });
+
+    test("should preserve whichever namespace descriptions are available", () => {
+      for (const [namespaceDescription, toolDescription, expected] of [
+        ["Namespace instructions", undefined, "Namespace instructions"],
+        [undefined, "Tool instructions", "Tool instructions"],
+        [undefined, undefined, ""],
+        ["", "Tool instructions", "Tool instructions"],
+      ]) {
+        const { tools } = convertResponsesToolsToVSCode([
+          {
+            type: "namespace",
+            name: "utilities",
+            description: namespaceDescription,
+            tools: [
+              {
+                type: "custom",
+                name: "exec",
+                description: toolDescription,
+              },
+            ],
+          },
+        ] as any);
+        assert.strictEqual(tools[0].description, expected);
+      }
+    });
+
+    test("should round-trip namespaced custom code using the declared wrapper", () => {
+      const declarations = [
+        {
+          type: "namespace",
+          name: "functions",
+          description:
+            "Discover tools through ALL_TOOLS and call tools by name.",
+          tools: [
+            {
+              type: "custom",
+              name: "exec",
+              description: "Run JavaScript",
+              format: { type: "text" },
+            },
+          ],
+        },
+      ];
+      const snapshot = JSON.stringify(declarations);
+      const { tools, toolMap } = convertResponsesToolsToVSCode(
+        declarations as any,
+      );
+      const source = 'const message = "quoted";\ntext(message);';
+      const wrappedInput = JSON.parse(JSON.stringify({ input: source }));
+      const schema = tools[0].inputSchema as {
+        properties: { input: { type: string } };
+        required: string[];
+      };
+      assert.strictEqual(schema.properties.input.type, "string");
+      assert.deepStrictEqual(schema.required, ["input"]);
+      assert.strictEqual(
+        tools[0].description,
+        "Discover tools through ALL_TOOLS and call tools by name.\n\nRun JavaScript",
+      );
+      const [output] = buildResponseOutput(
+        "",
+        [{ callId: "call_exec", name: tools[0].name, input: wrappedInput }],
+        toolMap,
+      );
+      assert.strictEqual(output.type, "custom_tool_call");
+      if (output.type !== "custom_tool_call") {
+        assert.fail("Expected a custom tool call");
+      }
+      assert.strictEqual(output.input, source);
+      assert.strictEqual(output.name, "exec");
+      assert.strictEqual(output.namespace, "functions");
+      const replay = convertResponsesItemToVSCode(output);
+      const part = replay?.content[0];
+      assert.ok(part instanceof vscode.LanguageModelToolCallPart);
+      assert.strictEqual(part.name, tools[0].name);
+      assert.deepStrictEqual(part.input, wrappedInput);
+      assert.strictEqual(JSON.stringify(declarations), snapshot);
     });
 
     test("should expose Codex collaboration messages as plaintext", () => {

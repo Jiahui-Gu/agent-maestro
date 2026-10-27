@@ -14,6 +14,7 @@ For automation, Agent Maestro also exposes Roo Code tasks through REST and MCP: 
 
 - **Choose your client and model.** Connect through Anthropic Messages, OpenAI Chat Completions/Responses, or Gemini-compatible endpoints, with setup commands for four clients and a picker of available Copilot models.
 - **Work with tools and images.** Supported tool histories and image inputs are converted to VS Code messages. Ordinary client tools still execute in the client; AM does not run them on its behalf.
+- **Replay Responses reasoning on compatible hosts.** Agent Maestro detects the host's optional thinking runtime and preserves encrypted state across tool continuations without enabling proposed APIs. See [reasoning compatibility](docs/openai-responses-api-design.md#reasoning-state).
 - **Search for current information.** Exa-backed search supports declared Anthropic/Responses web-search tools and experimental Codex standalone search, with source links and protocol-specific limits.
 - **Configure longer conversations.** Claude Code and Codex setup uses the selected model's advertised context window. Streaming heartbeats keep supported clients connected while a response is pending.
 - **Automate Roo tasks.** Use HTTP/SSE for task progress and interaction, or the MCP task tool for up to 20 concurrent tasks.
@@ -24,13 +25,15 @@ This README and the [documentation index](docs/README.md) describe this checkout
 
 ### Prerequisites
 
-- VS Code **1.120.0 or newer**, with GitHub Copilot signed in and eligible models available. The LLM proxy currently selects models from the `copilot` vendor.
+- VS Code **1.142.0 or newer**, with GitHub Copilot signed in and eligible models available. The LLM proxy currently selects models from the `copilot` vendor.
 - Install the client you want to use: Claude Code, Claude Desktop, Codex, or Gemini CLI. Installing a client alone does not provide proxy models.
 - Install Roo Code or a compatible variant such as Kilo Code only if you need task orchestration. Cline is optional and currently supports task creation only.
 
 For source development, use Node.js 22 or newer and the pnpm version specified in [package.json](package.json).
 
 This checkout preserves OpenAI instruction roles using VS Code's proposed `languageModelSystem` API. Development/test launches enable it explicitly. Installed development builds require `code --enable-proposed-api=joouis.agent-maestro`; ordinary Marketplace publication is blocked while this proposed API dependency remains. See [instruction-role compatibility](docs/llm-compatibility.md#instruction-roles).
+
+Responses reasoning replay has been verified with VS Code **1.142.0 / Copilot 0.70.0**. Availability still depends on the host runtime and provider, so Agent Maestro checks the capability at runtime.
 
 ### 1. Install and Start the Proxy
 
@@ -169,18 +172,24 @@ Use these Command Palette actions to manage the extension:
 - **Agent Maestro: Start MCP Server**, **Stop MCP Server**, **Get MCP Server Status**, **Install MCP Configuration**.
 - **Agent Maestro: Get Extensions Status**.
 - **Agent Maestro: Set Exa API Key** to configure or clear an optional search-provider key.
+- **Agent Maestro: Configure Copilot Prompt Cache** to choose **Implicit** (`false`, recommended for AM) or **Explicit** (`true`, uses prompt cache breakpoints). Startup cache warnings use a modal dialog; settings change only after confirmation. Successfully applying implicit mode resets the reminder, so a later mode change can trigger a new warning.
 
 ## Troubleshooting and Diagnostics
 
-| Symptom                                       | First check                                                                                            |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| Connection refused                            | Keep the VS Code window open; check **Get API Server Status** and the client's configured port.        |
-| No models in the setup picker                 | Check Copilot sign-in, model access, and model-discovery messages in AM Output.                        |
-| HTTP 401                                      | Match the server key and provider-specific header; see the Claude Code authentication note above.      |
-| Client answers but AM has no matching request | Start a new client session and inspect its active provider/base URL and project/environment overrides. |
-| MCP unavailable with Kilo                     | Select Kilo as the default Roo extension and reload; check the generated MCP URL for custom ports.     |
+| Symptom                                       | First check                                                                                                              |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Connection refused                            | Keep the VS Code window open; check **Get API Server Status** and the client's configured port.                          |
+| No models in the setup picker                 | Check Copilot sign-in, model access, and model-discovery messages in AM Output.                                          |
+| HTTP 401                                      | Match the server key and provider-specific header; see the Claude Code authentication note above.                        |
+| Client answers but AM has no matching request | Start a new client session and inspect its active provider/base URL and project/environment overrides.                   |
+| MCP unavailable with Kilo                     | Select Kilo as the default Roo extension and reload; check the generated MCP URL for custom ports.                       |
+| GPT requests always show `cache_read: 0`      | Run **Configure Copilot Prompt Cache** and choose **Implicit** (`false`, recommended for AM); see the explanation below. |
 
 Start with the **Agent Maestro** Output channel. Supported LLM request failures also append diagnostics to a timestamped `*-debug.log` in the first workspace folder when file logging succeeds; the error response includes the path when available.
+
+**GPT-5.6 / GPT-6 cache misses:** Copilot experiments can enable explicit prompt caching even if you have never configured it. AM's LM API requests do not carry the required cache breakpoints, so supported models can repeatedly report `cache_read: 0` despite sharing a long prefix after warm-up, increasing token costs.
+
+In **the VS Code window running AM**, open the Command Palette (`Ctrl+Shift+P` on Windows/Linux, `Cmd+Shift+P` on macOS), run **Agent Maestro: Configure Copilot Prompt Cache**, and choose **Implicit** (`false`, recommended for AM), the first option. This saves User settings and clears the current Workspace override after confirmation. It also affects native Copilot Chat and other windows using those User settings; other workspaces' overrides remain unchanged. New requests use the updated mode without a reload. See [GPT prompt cache](docs/copilot-gpt-prompt-cache.md) for details and other causes of zero cache hits.
 
 **Review every log before sharing it.** Known Anthropic message fields are redacted in diagnostic files, but system prompts, tool definitions, unknown fields, and error details can remain. Raw OpenAI/Gemini request bodies are not redacted. Debug-level Output logs are a separate channel and can contain request or response content. See the [logging scope](docs/llm-compatibility.md#diagnostic-logs).
 

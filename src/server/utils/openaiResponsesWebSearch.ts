@@ -1,6 +1,7 @@
 import {
   ResponseFunctionWebSearch,
   ResponseOutputMessage,
+  ResponseOutputText,
   ResponseUsage,
   Tool,
 } from "openai/resources/responses/responses";
@@ -23,12 +24,19 @@ import {
   LanguageModelRequestLifecycle,
   interruptibleLanguageModelStream,
 } from "./languageModelRequestLifecycle";
+import {
+  createModelMessage,
+  hasEncryptedThinking,
+  isThinkingPart,
+} from "./languageModelThinking";
 import { extractOpenAIResponsesUsage } from "./openai";
 import {
   OutputItem,
+  ReasoningItems,
+  ResponsesModelPart,
   ToolChoice,
   ToolMap,
-  buildResponseOutput,
+  buildResponseOutputFromParts,
   convertResponsesToolsToVSCode,
   convertToolChoice,
   generateMessageId,
@@ -635,7 +643,7 @@ export function prepareOpenAIResponsesTools({
 
 interface CollectedModelRound {
   incomplete: boolean;
-  parts: Array<vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart>;
+  parts: ResponsesModelPart[];
   usage: ResponseUsage;
 }
 
@@ -704,9 +712,8 @@ const collectModelRound = async ({
   const response = await lifecycle.waitFor(
     client.sendRequest(messages, requestOptions, lifecycle.token),
   );
-  const parts: Array<
-    vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart
-  > = [];
+  const parts: ResponsesModelPart[] = [];
+  const reasoning = new ReasoningItems("provider");
   let usage: ResponseUsage | undefined;
   let incomplete = false;
 
@@ -724,6 +731,13 @@ const collectModelRound = async ({
         }
       } else if (chunk instanceof vscode.LanguageModelToolCallPart) {
         parts.push(chunk);
+      } else if (isThinkingPart(chunk)) {
+        if (
+          hasEncryptedThinking(chunk) &&
+          reasoning.accept(chunk.id, chunk.metadata.encrypted_content)
+        ) {
+          parts.push(chunk);
+        }
       } else if (chunk instanceof vscode.LanguageModelDataPart) {
         usage = extractOpenAIResponsesUsage(chunk) ?? usage;
       }
@@ -740,11 +754,13 @@ const collectModelRound = async ({
       .map((part) =>
         part instanceof vscode.LanguageModelTextPart
           ? part.value
-          : JSON.stringify({
-              callId: part.callId,
-              name: part.name,
-              input: part.input,
-            }),
+          : isThinkingPart(part)
+            ? ""
+            : JSON.stringify({
+                callId: part.callId,
+                name: part.name,
+                input: part.input,
+              }),
       )
       .join("");
     const [inputTokens, outputTokens] = await lifecycle.waitFor(
@@ -767,38 +783,11 @@ const collectModelRound = async ({
 };
 
 const buildOutputFromParts = (
-  parts: readonly (
-    | vscode.LanguageModelTextPart
-    | vscode.LanguageModelToolCallPart
-  )[],
+  parts: readonly ResponsesModelPart[],
   toolMap: ToolMap,
   incomplete: boolean,
 ): OutputItem[] => {
-  const output: OutputItem[] = [];
-  let text = "";
-  const flushText = () => {
-    if (!text) {
-      return;
-    }
-    output.push(...buildResponseOutput(text, [], toolMap));
-    text = "";
-  };
-
-  for (const part of parts) {
-    if (part instanceof vscode.LanguageModelTextPart) {
-      text += part.value;
-      continue;
-    }
-    flushText();
-    output.push(
-      ...buildResponseOutput(
-        "",
-        [{ callId: part.callId, name: part.name, input: part.input }],
-        toolMap,
-      ),
-    );
-  }
-  flushText();
+  const output = buildResponseOutputFromParts(parts, toolMap);
   if (incomplete) {
     for (let index = output.length - 1; index >= 0; index--) {
       const item = output[index];
@@ -807,34 +796,6 @@ const buildOutputFromParts = (
         break;
       }
     }
-  }
-  return output;
-};
-
-const buildLegacyOutputFromParts = (
-  parts: readonly (
-    | vscode.LanguageModelTextPart
-    | vscode.LanguageModelToolCallPart
-  )[],
-  toolMap: ToolMap,
-  incomplete: boolean,
-): OutputItem[] => {
-  const text = parts
-    .filter(
-      (part): part is vscode.LanguageModelTextPart =>
-        part instanceof vscode.LanguageModelTextPart,
-    )
-    .map(({ value }) => value)
-    .join("");
-  const toolCalls = parts
-    .filter(
-      (part): part is vscode.LanguageModelToolCallPart =>
-        part instanceof vscode.LanguageModelToolCallPart,
-    )
-    .map(({ callId, name, input }) => ({ callId, name, input }));
-  const output = buildResponseOutput(text, toolCalls, toolMap);
-  if (incomplete && output[0]?.type === "message") {
-    output[0].status = "incomplete";
   }
   return output;
 };
@@ -902,31 +863,28 @@ const findSourceUrlOccurrences = (
 };
 
 const appendSourcesAndBuildCitations = async ({
-  text,
+  textParts,
   results,
   usage,
   maxOutputTokens,
   client,
   lifecycle,
 }: {
-  text: string;
+  textParts: ResponseOutputText[];
   results: readonly WebSearchResult[];
   usage: ResponseUsage;
   maxOutputTokens?: number;
   client: vscode.LanguageModelChat;
   lifecycle: LanguageModelRequestLifecycle;
 }): Promise<{
-  annotations: UrlCitation[];
   exhausted: boolean;
-  text: string;
   usage: ResponseUsage;
 }> => {
-  let finalText = text;
   let finalUsage = usage;
   let exhausted = false;
   const citedUrls = new Set(
-    findSourceUrlOccurrences(finalText, results).map(
-      ({ result }) => result.url,
+    textParts.flatMap(({ text }) =>
+      findSourceUrlOccurrences(text, results).map(({ result }) => result.url),
     ),
   );
   let addedSource = false;
@@ -945,7 +903,7 @@ const appendSourcesAndBuildCitations = async ({
       exhausted = true;
       break;
     }
-    finalText += entry;
+    textParts[textParts.length - 1].text += entry;
     finalUsage = withOutputTokens(
       finalUsage,
       finalUsage.output_tokens + entryTokens,
@@ -954,20 +912,19 @@ const appendSourcesAndBuildCitations = async ({
     addedSource = true;
   }
 
-  const annotations: UrlCitation[] = findSourceUrlOccurrences(
-    finalText,
-    results,
-  ).map(({ startIndex, endIndex, result }) => ({
-    type: "url_citation",
-    start_index: startIndex,
-    end_index: endIndex,
-    url: result.url,
-    title: result.title,
-  }));
+  for (const part of textParts) {
+    part.annotations = findSourceUrlOccurrences(part.text, results).map(
+      ({ startIndex, endIndex, result }) => ({
+        type: "url_citation",
+        start_index: startIndex,
+        end_index: endIndex,
+        url: result.url,
+        title: result.title,
+      }),
+    );
+  }
   return {
-    annotations,
     exhausted,
-    text: finalText,
     usage: finalUsage,
   };
 };
@@ -1006,7 +963,6 @@ export async function runOpenAIResponsesWebSearchLoop({
   lifecycle,
   maxOutputTokens,
   providerTimeoutMs,
-  preserveLegacyNonStreamingOutput = false,
   callbacks = {},
 }: {
   client: vscode.LanguageModelChat;
@@ -1017,7 +973,6 @@ export async function runOpenAIResponsesWebSearchLoop({
   lifecycle: LanguageModelRequestLifecycle;
   maxOutputTokens?: number;
   providerTimeoutMs: number;
-  preserveLegacyNonStreamingOutput?: boolean;
   callbacks?: OpenAIResponsesSearchLoopCallbacks;
 }): Promise<OpenAIResponsesSearchLoopResult> {
   if (
@@ -1062,17 +1017,11 @@ export async function runOpenAIResponsesWebSearchLoop({
       firstRound.usage.output_tokens >= maxOutputTokens);
   if (internalCalls.length === 0) {
     return {
-      output: preserveLegacyNonStreamingOutput
-        ? buildLegacyOutputFromParts(
-            visibleParts,
-            preparedTools.toolMap,
-            firstRoundIncomplete,
-          )
-        : buildOutputFromParts(
-            visibleParts,
-            preparedTools.toolMap,
-            firstRoundIncomplete,
-          ),
+      output: buildOutputFromParts(
+        visibleParts,
+        preparedTools.toolMap,
+        firstRoundIncomplete,
+      ),
       incomplete: firstRoundIncomplete,
       usage:
         maxOutputTokens !== undefined &&
@@ -1227,7 +1176,10 @@ export async function runOpenAIResponsesWebSearchLoop({
     client,
     messages: [
       ...messages,
-      vscode.LanguageModelChatMessage.Assistant(firstRound.parts),
+      createModelMessage(
+        vscode.LanguageModelChatMessageRole.Assistant,
+        firstRound.parts,
+      ),
       vscode.LanguageModelChatMessage.User(toolResults),
     ],
     lifecycle,
@@ -1245,33 +1197,37 @@ export async function runOpenAIResponsesWebSearchLoop({
     usage = withOutputTokens(usage, maxOutputTokens);
   }
 
-  const synthesisText = synthesisRound.parts
-    .filter(
-      (part): part is vscode.LanguageModelTextPart =>
-        part instanceof vscode.LanguageModelTextPart,
-    )
-    .map(({ value }) => value)
-    .join("");
-  const cited =
-    searchSucceeded && results.length > 0
-      ? await appendSourcesAndBuildCitations({
-          text: synthesisText,
-          results,
-          usage,
-          maxOutputTokens,
-          client,
-          lifecycle,
-        })
-      : {
-          annotations: [],
-          exhausted: false,
-          text: synthesisText,
-          usage,
-        };
-  usage = cited.usage;
-  incomplete ||= cited.exhausted;
-  const output: OutputItem[] = [completedSearchItem];
-  output.push(createMessageOutput(cited.text, cited.annotations, incomplete));
+  const output: OutputItem[] = [
+    completedSearchItem,
+    ...buildResponseOutputFromParts(
+      synthesisRound.parts.filter(
+        (part) => !(part instanceof vscode.LanguageModelToolCallPart),
+      ),
+      preparedTools.toolMap,
+    ),
+  ];
+  let finalMessage = output.at(-1);
+  if (finalMessage?.type !== "message") {
+    finalMessage = createMessageOutput("", [], false);
+    output.push(finalMessage);
+  }
+  if (searchSucceeded && results.length > 0) {
+    const cited = await appendSourcesAndBuildCitations({
+      textParts: output.flatMap((item) =>
+        item.type === "message"
+          ? item.content.filter((part) => part.type === "output_text")
+          : [],
+      ),
+      results,
+      usage,
+      maxOutputTokens,
+      client,
+      lifecycle,
+    });
+    usage = cited.usage;
+    incomplete ||= cited.exhausted;
+  }
+  finalMessage.status = incomplete ? "incomplete" : "completed";
 
   return {
     output,

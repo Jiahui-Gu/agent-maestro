@@ -12,8 +12,571 @@ import { registerAnthropicRoutes } from "../../server/routes/anthropicRoutes";
 import { registerGeminiRoutes } from "../../server/routes/geminiRoutes";
 import { registerOpenaiChatRoutes } from "../../server/routes/openai/openaiChatRoutes";
 import { registerOpenaiResponsesRoutes } from "../../server/routes/openai/openaiResponsesRoutes";
+import {
+  ThinkingPart,
+  getThinkingRuntime,
+} from "../../server/utils/languageModelThinking";
 
 suite("Normalized history through official SDKs", () => {
+  const modelMetadata = {
+    id: "gpt-reasoning-test",
+    name: "Test",
+    family: "gpt",
+    vendor: "copilot",
+    version: "test",
+    maxInputTokens: 200000,
+    countTokens: async () => 1,
+  };
+  const responsesApp = (model: vscode.LanguageModelChat) => {
+    const app = new OpenAPIHono();
+    registerOpenaiResponsesRoutes(app, {
+      requestTimeoutMs: 2000,
+      resolveChatModelClient: async () => ({ client: model }),
+    });
+    return app;
+  };
+  const responsesClient = (app: OpenAPIHono) =>
+    new OpenAI({
+      apiKey: "test",
+      baseURL: "http://localhost/v1",
+      maxRetries: 0,
+      fetch: async (input, init) => app.request(new Request(input, init)),
+    });
+
+  for (const stream of [false, true]) {
+    test(`Responses classifies provider reasoning conflicts correctly (stream=${stream})`, async () => {
+      const runtime = getThinkingRuntime()!;
+      const model = {
+        ...modelMetadata,
+        sendRequest: async () => ({
+          stream: (async function* () {
+            for (const encrypted_content of [
+              "first-private-state",
+              "second-private-state",
+            ]) {
+              yield new runtime.Thinking("", "same-provider-id", {
+                encrypted_content,
+                vscode_thinking_origin_api: "responses",
+              });
+            }
+          })(),
+          text: (async function* () {})(),
+        }),
+      } as vscode.LanguageModelChat;
+      const app = responsesApp(model);
+      const response = await app.request("/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: model.id, input: "Check", stream }),
+      });
+      const body = await response.text();
+      assert.ok(!body.includes("second-private-state"));
+      if (!stream) {
+        assert.ok(!body.includes("first-private-state"));
+        assert.strictEqual(response.status, 502);
+        const result = JSON.parse(body);
+        assert.strictEqual(result.error.type, "upstream_error");
+        assert.strictEqual(result.error.param, null);
+        assert.strictEqual(result.error.code, "invalid_provider_reasoning");
+      } else {
+        assert.strictEqual(response.status, 200);
+        const events = body
+          .split("\n")
+          .filter((line) => line.startsWith("data: "))
+          .map((line) => JSON.parse(line.slice(6)));
+        assert.strictEqual(events.at(-1).type, "response.failed");
+        assert.strictEqual(
+          events.at(-1).response.error.code,
+          "invalid_provider_reasoning",
+        );
+        assert.ok(
+          !JSON.stringify(events.at(-1)).includes("first-private-state"),
+        );
+        assert.ok(!events.some((event) => event.type === "response.completed"));
+        const reasoningDone = events.filter(
+          (event) =>
+            event.type === "response.output_item.done" &&
+            event.item.type === "reasoning",
+        );
+        assert.strictEqual(reasoningDone.length, 1);
+        assert.strictEqual(
+          reasoningDone[0].item.encrypted_content,
+          "am_reasoning_v1:16:same-provider-idfirst-private-state",
+        );
+      }
+    });
+  }
+
+  test("Responses still classifies conflicting input reasoning as a client error", async () => {
+    let requests = 0;
+    const model = {
+      id: "gpt-input-conflict",
+      sendRequest: async () => {
+        requests++;
+        throw new Error("Unexpected dispatch");
+      },
+    } as unknown as vscode.LanguageModelChat;
+    const app = responsesApp(model);
+    const response = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: model.id,
+        input: [
+          {
+            type: "reasoning",
+            id: "same-id",
+            summary: [],
+            encrypted_content: "first",
+          },
+          {
+            type: "reasoning",
+            id: "same-id",
+            summary: [],
+            encrypted_content: "second",
+          },
+        ],
+      }),
+    });
+    assert.strictEqual(response.status, 400);
+    const result = (await response.json()) as any;
+    assert.strictEqual(result.error.code, "invalid_reasoning");
+    assert.strictEqual(result.error.param, "input");
+    assert.strictEqual(requests, 0);
+  });
+  test("Responses preserves text/tool ordering with or without reasoning in JSON and SSE", async () => {
+    for (const stream of [false, true]) {
+      for (const includeThinking of [false, true]) {
+        const runtime = getThinkingRuntime()!;
+        const thinking = new runtime.Thinking("", "rs_repeat", {
+          encrypted_content: "state",
+          vscode_thinking_origin_api: "responses",
+        });
+        const model = {
+          ...modelMetadata,
+          sendRequest: async () => ({
+            stream: (async function* () {
+              if (includeThinking) {
+                yield thinking;
+              }
+              yield new vscode.LanguageModelTextPart("A");
+              yield new vscode.LanguageModelToolCallPart("call", "lookup", {});
+              if (includeThinking) {
+                yield thinking;
+              }
+              yield new vscode.LanguageModelTextPart("B");
+            })(),
+            text: (async function* () {})(),
+          }),
+        } as vscode.LanguageModelChat;
+        const app = responsesApp(model);
+        const client = responsesClient(app);
+        const response = await client.responses.create({
+          model: model.id,
+          input: "Read",
+          stream,
+        });
+        let output: OpenAI.Responses.ResponseOutputItem[] = [];
+        if ("output" in response) {
+          output = response.output;
+        } else {
+          for await (const event of response) {
+            if (event.type === "response.completed") {
+              output = event.response.output;
+            }
+          }
+        }
+        assert.strictEqual(
+          output.filter(({ type }) => type === "reasoning").length,
+          includeThinking ? 1 : 0,
+        );
+        assert.deepStrictEqual(
+          output
+            .filter(({ type }) => type !== "reasoning")
+            .map((item) =>
+              item.type === "message"
+                ? item.content
+                    .map((part) =>
+                      part.type === "output_text" ? part.text : "",
+                    )
+                    .join("")
+                : item.type,
+            ),
+          ["A", "function_call", "B"],
+        );
+      }
+    }
+  });
+
+  test("Responses rejects malformed encrypted reasoning before dispatch", async () => {
+    let requests = 0;
+    const model = {
+      id: "gpt-invalid",
+      sendRequest: async () => {
+        requests++;
+        throw new Error("unexpected");
+      },
+    } as unknown as vscode.LanguageModelChat;
+    const app = responsesApp(model);
+    for (const stream of [false, true]) {
+      for (const encrypted_content of [
+        42,
+        "am_reasoning_v1:9007199254740992:private-state",
+        "am_reasoning_v1:3:🧠private-state",
+        "am_reasoning_v1:3:abc",
+      ]) {
+        const response = await app.request("/v1/responses", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: model.id,
+            stream,
+            input: [
+              { type: "reasoning", id: "rs", encrypted_content, summary: [] },
+            ],
+          }),
+        });
+        assert.strictEqual(response.status, 400);
+        const result = (await response.json()) as {
+          error: { code: string; param: string };
+        };
+        assert.strictEqual(result.error.code, "invalid_reasoning");
+        assert.strictEqual(result.error.param, "input");
+        assert.strictEqual(requests, 0);
+      }
+    }
+  });
+  test("Responses rejects metadata-discarding hosts before dispatch in JSON and SSE", async () => {
+    const runtime = getThinkingRuntime()!;
+    const originalThinking = runtime.Thinking;
+    runtime.Thinking = class {
+      readonly metadata = {};
+      constructor(
+        readonly value: string | string[],
+        readonly id?: string,
+      ) {}
+    };
+    let requests = 0;
+    const model = {
+      ...modelMetadata,
+      sendRequest: async () => {
+        requests++;
+        throw new Error("Unexpected dispatch");
+      },
+    } as vscode.LanguageModelChat;
+    const app = responsesApp(model);
+    try {
+      for (const stream of [false, true]) {
+        for (const conflicting of [false, true]) {
+          const response = await app.request("/v1/responses", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              model: model.id,
+              stream,
+              input: ["first", conflicting ? "second" : "first"].map(
+                (encrypted_content) => ({
+                  type: "reasoning",
+                  id: "same-id",
+                  summary: [],
+                  encrypted_content,
+                }),
+              ),
+            }),
+          });
+          assert.strictEqual(response.status, 400);
+          const result = (await response.json()) as {
+            error: { code: string; param: string };
+          };
+          assert.strictEqual(result.error.code, "reasoning_unavailable");
+          assert.strictEqual(result.error.param, "input");
+          assert.strictEqual(requests, 0);
+        }
+      }
+    } finally {
+      runtime.Thinking = originalThinking;
+    }
+  });
+  for (const stream of [false, true] as const) {
+    for (const custom of [false, true]) {
+      test(`Responses reasoning survives SDK tool continuation (stream=${stream}, custom=${custom})`, async () => {
+        const reasoningId = "rs:tool:状态:🧠";
+        const encryptedState = "opaque:tool___state:".repeat(1_000);
+        let requestCount = 0;
+        const model = {
+          ...modelMetadata,
+          sendRequest: async (messages, options) => {
+            assert.strictEqual(
+              (options as { includeEncryptedThinking?: boolean })
+                ?.includeEncryptedThinking,
+              true,
+            );
+            requestCount++;
+            if (requestCount === 2) {
+              const parts = messages.flatMap(({ content }) => content);
+              const thinking = parts.find(
+                (part) => part instanceof getThinkingRuntime()!.Thinking,
+              ) as unknown as ThinkingPart;
+              assert.strictEqual(thinking.id, reasoningId);
+              assert.deepStrictEqual(thinking.metadata, {
+                encrypted_content: encryptedState,
+                vscode_thinking_origin_api: "responses",
+              });
+              assert.strictEqual(thinking.value, "");
+              assert.strictEqual(
+                parts.filter(
+                  (part) => part instanceof vscode.LanguageModelToolCallPart,
+                ).length,
+                1,
+              );
+              assert.strictEqual(
+                parts.filter(
+                  (part) => part instanceof vscode.LanguageModelToolResultPart,
+                ).length,
+                1,
+              );
+            }
+            return {
+              stream: (async function* () {
+                yield new (getThinkingRuntime()!.Thinking)(
+                  "private-text",
+                  undefined,
+                );
+                yield new (getThinkingRuntime()!.Thinking)(
+                  "",
+                  requestCount === 1 ? reasoningId : "rs_final",
+                  {
+                    encrypted_content:
+                      requestCount === 1
+                        ? encryptedState
+                        : "opaque-final-state",
+                    vscode_thinking_origin_api: "responses",
+                  },
+                );
+                if (requestCount === 1) {
+                  yield new vscode.LanguageModelTextPart("Before lookup");
+                  yield new vscode.LanguageModelToolCallPart(
+                    "lookup-call",
+                    "lookup",
+                    custom ? { input: "lookup()" } : {},
+                  );
+                  yield new vscode.LanguageModelTextPart("After lookup");
+                } else {
+                  yield new vscode.LanguageModelTextPart("ready");
+                }
+              })(),
+              text: (async function* () {})(),
+            };
+          },
+        } as vscode.LanguageModelChat;
+        const app = responsesApp(model);
+        const client = responsesClient(app);
+        const tools: OpenAI.Responses.Tool[] = custom
+          ? [{ type: "custom", name: "lookup", format: { type: "text" } }]
+          : [
+              {
+                type: "function",
+                name: "lookup",
+                strict: false,
+                parameters: { type: "object", properties: {} },
+              },
+            ];
+        const history: OpenAI.Responses.ResponseInput = [
+          { role: "user", content: "Read status" },
+        ];
+        const collect = async () => {
+          const response = await client.responses.create({
+            model: model.id,
+            stream,
+            tools,
+            input: history,
+          });
+          if ("output" in response) {
+            return response.output;
+          }
+          const done: OpenAI.Responses.ResponseOutputItem[] = [];
+          let terminal: OpenAI.Responses.ResponseOutputItem[] = [];
+          const sequence: number[] = [];
+          for await (const event of response) {
+            if (event.type === "response.output_item.done") {
+              done.push(event.item);
+            }
+            if (event.type === "response.completed") {
+              terminal = event.response.output;
+            }
+            sequence.push(event.sequence_number);
+          }
+          assert.deepStrictEqual(done, terminal);
+          assert.deepStrictEqual(
+            sequence,
+            sequence.map((_, index) => index),
+          );
+          return terminal;
+        };
+        const output = await collect();
+        assert.deepStrictEqual(
+          output.map(({ type }) => type),
+          [
+            "reasoning",
+            "message",
+            custom ? "custom_tool_call" : "function_call",
+            "message",
+          ],
+        );
+        const reasoning = output[0];
+        if (reasoning.type !== "reasoning") {
+          assert.fail("Expected reasoning before tool output");
+        }
+        assert.strictEqual(
+          reasoning.encrypted_content,
+          `am_reasoning_v1:${Buffer.byteLength(reasoningId, "utf8")}:${reasoningId}${encryptedState}`,
+        );
+        assert.ok(!JSON.stringify(output).includes("private-text"));
+        history.push(
+          ...(output.map((item) => {
+            if (item.type !== "reasoning") {
+              return item;
+            }
+            const { id: _id, ...replay } = item;
+            return replay;
+          }) as OpenAI.Responses.ResponseInput),
+          custom
+            ? {
+                type: "custom_tool_call_output",
+                call_id: "lookup-call",
+                output: "ready",
+              }
+            : {
+                type: "function_call_output",
+                call_id: "lookup-call",
+                output: "ready",
+              },
+        );
+        const final = await collect();
+        assert.deepStrictEqual(
+          final.map(({ type }) => type),
+          ["reasoning", "message"],
+        );
+        assert.strictEqual(requestCount, 2);
+      });
+    }
+    test(`Responses custom tools retain their input contract (stream=${stream})`, async () => {
+      const source = 'const message = "quoted";\ntext(message);';
+      let requestCount = 0;
+      const model = {
+        id: "gpt-test",
+        name: "Test",
+        family: "gpt",
+        vendor: "copilot",
+        version: "test",
+        maxInputTokens: 200000,
+        capabilities: { supportsToolCalling: true, supportsImageToText: false },
+        countTokens: async () => 1,
+        sendRequest: async (messages, options) => {
+          requestCount++;
+          const tool = options?.tools?.[0];
+          assert.strictEqual(tool?.name, "functions__exec");
+          assert.strictEqual(
+            tool.description,
+            "Discover tools through ALL_TOOLS.\n\nRun JavaScript",
+          );
+          const schema = tool.inputSchema as {
+            required: string[];
+            properties: { input: { type: string } };
+          };
+          assert.deepStrictEqual(schema.required, ["input"]);
+          assert.strictEqual(schema.properties.input.type, "string");
+          const replay = messages
+            .flatMap((message) => message.content)
+            .find((part) => part instanceof vscode.LanguageModelToolCallPart);
+          assert.ok(replay instanceof vscode.LanguageModelToolCallPart);
+          assert.strictEqual(replay.name, tool.name);
+          assert.deepStrictEqual(replay.input, { input: "text(ALL_TOOLS);" });
+          return {
+            stream: (async function* () {
+              yield new vscode.LanguageModelToolCallPart(
+                "new-exec-call",
+                tool.name,
+                { input: source },
+              );
+            })(),
+            text: (async function* () {})(),
+          };
+        },
+      } as vscode.LanguageModelChat;
+      const app = new OpenAPIHono();
+      registerOpenaiResponsesRoutes(app, {
+        requestTimeoutMs: 2000,
+        resolveChatModelClient: async () => ({ client: model }),
+      });
+      const client = new OpenAI({
+        apiKey: "test",
+        baseURL: "http://localhost/v1",
+        maxRetries: 0,
+        fetch: async (input, init) => app.request(new Request(input, init)),
+      });
+      const response = await client.responses.create({
+        model: model.id,
+        stream,
+        tools: [
+          {
+            type: "namespace",
+            name: "functions",
+            description: "Discover tools through ALL_TOOLS.",
+            tools: [
+              {
+                type: "custom",
+                name: "exec",
+                description: "Run JavaScript",
+                format: { type: "text" },
+              },
+            ],
+          },
+        ],
+        input: [
+          { role: "user", content: "Inspect available tools." },
+          {
+            type: "custom_tool_call",
+            call_id: "previous-exec-call",
+            name: "exec",
+            namespace: "functions",
+            input: "text(ALL_TOOLS);",
+          },
+          {
+            type: "custom_tool_call_output",
+            call_id: "previous-exec-call",
+            output: "[]",
+          },
+        ],
+      });
+      let output: OpenAI.Responses.ResponseOutputItem[] = [];
+      if ("output" in response) {
+        output = response.output;
+      } else {
+        const deltas: string[] = [];
+        for await (const event of response) {
+          if (event.type === "response.custom_tool_call_input.delta") {
+            deltas.push(event.delta);
+          }
+          if (event.type === "response.completed") {
+            output = event.response.output;
+          }
+        }
+        assert.strictEqual(deltas.join(""), source);
+      }
+      assert.strictEqual(requestCount, 1);
+      assert.strictEqual(output.length, 1);
+      const call = output[0];
+      if (call.type !== "custom_tool_call") {
+        assert.fail("Expected a custom tool call");
+      }
+      assert.strictEqual(call.name, "exec");
+      assert.strictEqual(call.namespace, "functions");
+      assert.strictEqual(call.call_id, "new-exec-call");
+      assert.strictEqual(call.input, source);
+    });
+  }
+
   test("all four routes preserve newly generated IDs while normalizing input", async () => {
     const captured: vscode.LanguageModelChatMessage[][] = [];
     const model = {

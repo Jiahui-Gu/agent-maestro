@@ -13,12 +13,13 @@ Start with the [project README](../README.md) for installation and client setup.
 | [Context-window handling](claude-code-context-window.md) | Copilot prompt budgets and Claude Code compaction                                      |
 | [SSE heartbeats](2026-08-11-sse-heartbeats.md)           | Authoritative heartbeat formats and serializer constraints                             |
 | [Image MIME workaround](vscode-image-mime-defect.md)     | Top-level resize workaround and Anthropic tool-result exception                        |
+| [GPT prompt cache](copilot-gpt-prompt-cache.md)          | Copilot explicit cache mode causing GPT cache misses, and the setting that fixes it    |
 
 The running `/openapi.json` supplies route schemas. It complements these guides; permissive LLM body schemas do not imply support for every upstream option.
 
 ## Runbooks and Contribution
 
-- [Testing](testing.md): local checks, suite locations, and manual validation.
+- [Testing](testing.md): local checks, suite locations, manual validation, and pre-release live CLI regression.
 - [Codex collaboration E2E](codex-multi-agent-e2e.md): authenticated manual test.
 - [Remote Roo demo](../examples/demo-site/README.md): local UI and protected remote access.
 - [Contributor instructions](../AGENTS.md), [release procedure](../.claude/commands/release.md), and [issue tracker](agents/issue-tracker.md).
