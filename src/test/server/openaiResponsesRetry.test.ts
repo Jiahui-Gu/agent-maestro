@@ -166,6 +166,27 @@ suite("OpenAI Responses Empty Response Retry Test Suite", () => {
     assert.strictEqual(requests.length, 2);
   });
 
+  test("keeps the output-limit default failure private outside hosted search", async () => {
+    const { model, requests } = createModel([
+      {
+        parts: [
+          new (getThinkingRuntime()!.Thinking)("", "rs_unhandled", {
+            encrypted_content: "unhandled-state",
+            vscode_thinking_origin_api: "responses",
+          }),
+        ],
+        error: new Error("Response too long for the configured limit"),
+      },
+    ]);
+    const response = await request(model);
+    const events = parseEvents(await response.text());
+
+    assert.strictEqual(requests.length, 1);
+    assert.strictEqual(events.at(-1)?.type, "response.failed");
+    assert.ok(!events.some(({ item }) => item?.type === "reasoning"));
+    assert.strictEqual(warnings.length, 0);
+  });
+
   test("surfaces the error after one unsuccessful retry", async () => {
     const { model, requests } = createModel([
       { error: noChoices() },

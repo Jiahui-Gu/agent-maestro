@@ -133,6 +133,7 @@ export async function* requestLanguageModelWithEmptyResponseRetry(
   messages: vscode.LanguageModelChatMessage[],
   options: vscode.LanguageModelChatRequestOptions,
   lifecycle: LanguageModelRequestLifecycle,
+  isIncompleteResponseError?: (error: unknown) => boolean,
 ): AsyncGenerator<unknown> {
   for (let attempt = 0; ; attempt++) {
     let committedOutput = false;
@@ -148,7 +149,7 @@ export async function* requestLanguageModelWithEmptyResponseRetry(
         response.stream,
         lifecycle,
       )) {
-        // Keep opaque-only reasoning private until this attempt has output or succeeds.
+        // Keep opaque-only reasoning private until this attempt can be committed.
         if (
           !committedOutput &&
           client.vendor === "copilot" &&
@@ -171,6 +172,10 @@ export async function* requestLanguageModelWithEmptyResponseRetry(
     } catch (error) {
       if (lifecycle.signal.aborted) {
         throw lifecycle.signal.reason;
+      }
+      if (isIncompleteResponseError?.(error)) {
+        yield* pendingThinking;
+        throw error;
       }
       // Never replay text, tools, visible thinking, usage, or unknown parts.
       if (

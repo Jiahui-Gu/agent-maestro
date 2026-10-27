@@ -720,6 +720,7 @@ const collectModelRound = async ({
       messages,
       requestOptions,
       lifecycle,
+      isResponseTooLongError,
     )) {
       if (chunk instanceof vscode.LanguageModelTextPart) {
         const previous = parts.at(-1);
