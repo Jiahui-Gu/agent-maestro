@@ -234,6 +234,66 @@ const parseSseData = (body: string): Record<string, any>[] =>
     .map((line) => JSON.parse(line.slice("data: ".length)));
 
 suite("OpenAI Responses Server Web Search Test Suite", () => {
+  test("recovers a no-choices error without repeating a completed search", async () => {
+    const prepared = prepareSearch();
+    const requests: Parameters<typeof createRoundModel>[1] = [];
+    let searches = 0;
+    const result = await runLoop({
+      prepared,
+      requests,
+      rounds: [
+        { chunks: [internalCall(prepared)] },
+        { chunks: [], error: new Error("Response contained no choices.") },
+        { chunks: [new vscode.LanguageModelTextPart("Recovered answer")] },
+      ],
+      provider: createProvider(async () => {
+        searches++;
+        return [];
+      }),
+    });
+
+    assert.strictEqual(searches, 1);
+    assert.strictEqual(requests.length, 3);
+    assert.deepStrictEqual(requests[1], requests[2]);
+    assert.ok(JSON.stringify(result.output).includes("Recovered answer"));
+  });
+
+  test("recovers no-choices errors through both hosted-search response modes", async () => {
+    for (const stream of [false, true]) {
+      const requests: Parameters<typeof createRoundModel>[1] = [];
+      const app = createTestApp({
+        requests,
+        rounds: [
+          { chunks: [], error: new Error("Response contained no choices.") },
+          { chunks: [new vscode.LanguageModelTextPart("Recovered answer")] },
+        ],
+        provider: createProvider(async () => []),
+      });
+      const response = await app.request("/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.6-test",
+          input: "Synthetic retry check",
+          tools: [webSearchTool()],
+          stream,
+        }),
+      });
+      const body = await response.text();
+
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(requests.length, 2);
+      assert.ok(body.includes("Recovered answer"));
+      if (stream) {
+        const events = parseSseData(body);
+        assert.strictEqual(events.at(-1)?.type, "response.completed");
+        assert.ok(!events.some(({ type }) => type === "response.failed"));
+      } else {
+        assert.strictEqual(JSON.parse(body).status, "completed");
+      }
+    }
+  });
+
   test("reports provider reasoning conflicts when the hosted-search route returns client output", async () => {
     for (const stream of [false, true]) {
       const runtime = getThinkingRuntime()!;

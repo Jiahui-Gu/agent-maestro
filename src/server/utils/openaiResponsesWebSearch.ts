@@ -22,7 +22,7 @@ import {
 import { isResponseTooLongError } from "./languageModelErrors";
 import {
   LanguageModelRequestLifecycle,
-  interruptibleLanguageModelStream,
+  requestLanguageModelWithEmptyResponseRetry,
 } from "./languageModelRequestLifecycle";
 import {
   createModelMessage,
@@ -709,17 +709,16 @@ const collectModelRound = async ({
   requestOptions: vscode.LanguageModelChatRequestOptions;
   lifecycle: LanguageModelRequestLifecycle;
 }): Promise<CollectedModelRound> => {
-  const response = await lifecycle.waitFor(
-    client.sendRequest(messages, requestOptions, lifecycle.token),
-  );
   const parts: ResponsesModelPart[] = [];
   const reasoning = new ReasoningItems("provider");
   let usage: ResponseUsage | undefined;
   let incomplete = false;
 
   try {
-    for await (const chunk of interruptibleLanguageModelStream(
-      response.stream,
+    for await (const chunk of requestLanguageModelWithEmptyResponseRetry(
+      client,
+      messages,
+      requestOptions,
       lifecycle,
     )) {
       if (chunk instanceof vscode.LanguageModelTextPart) {
